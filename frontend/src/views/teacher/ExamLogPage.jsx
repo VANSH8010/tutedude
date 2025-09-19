@@ -8,7 +8,7 @@ import { toast } from 'react-toastify';
 
 // ✅ Connect to backend socket server
 // Local development
-const socket = io('http://localhost:5000');
+const socket = io('https://tutedude-jgyk.onrender.com');
 // ⚠️ Deployment ke time apne backend ka deployed URL use karo
 // Example: const socket = io('https://your-backend.onrender.com');
 
