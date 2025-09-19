@@ -1,0 +1,3 @@
+// we want a optimized way
+
+// Write your code here...
