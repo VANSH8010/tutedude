@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Box, Grid, CircularProgress } from '@mui/material';
 import PageContainer from 'src/components/container/PageContainer';
@@ -12,6 +12,12 @@ import { useSelector } from 'react-redux';
 import { toast } from 'react-toastify';
 import { useCheatingLog } from 'src/context/CheatingLogContext';
 
+// NEW IMPORTS
+import { startFocusDetection } from '../../utils/focusDetection';
+import { startRecording } from '../../utils/videoRecorder';
+import { startDrowsinessDetection } from '../../utils/drowsinessDetection';
+import { startAudioDetection } from '../../utils/audioDetection'; // 👈 NEW
+
 const TestPage = () => {
   const { examId, testId } = useParams();
   const [selectedExam, setSelectedExam] = useState(null);
@@ -23,43 +29,108 @@ const TestPage = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isMcqCompleted, setIsMcqCompleted] = useState(false);
 
+  const [questions, setQuestions] = useState([]);
+  const { data, isLoading } = useGetQuestionsQuery(examId);
+  const [score, setScore] = useState(0);
+  const navigate = useNavigate();
+
+  // VIDEO + DETECTION refs
+  const videoRef = useRef(null);
+  const recorderRef = useRef(null);
+
+  // Load exam info
   useEffect(() => {
     if (userExamdata) {
       const exam = userExamdata.find((exam) => exam.examId === examId);
       if (exam) {
         setSelectedExam(exam);
-        // Convert duration from minutes to seconds
         setExamDurationInSeconds(exam.duration);
         console.log('Exam duration (minutes):', exam.duration);
       }
     }
   }, [userExamdata, examId]);
 
-  const [questions, setQuestions] = useState([]);
-  const { data, isLoading } = useGetQuestionsQuery(examId);
-  const [score, setScore] = useState(0);
-  const navigate = useNavigate();
-
+  // Load questions
   useEffect(() => {
     if (data) {
       setQuestions(data);
     }
   }, [data]);
 
+  // Start camera, focus detection, drowsiness detection, audio detection, and recording
+  useEffect(() => {
+    async function init() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+
+        // 🔹 Focus detection
+        startFocusDetection(videoRef.current, (msg) => {
+          updateCheatingLog(examId, msg);
+          fetch('/api/log-event', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ event: msg, timestamp: new Date(), examId }),
+          });
+        });
+
+        // 🔹 Drowsiness detection
+        startDrowsinessDetection(videoRef.current, (msg) => {
+          updateCheatingLog(examId, msg);
+          fetch('/api/log-event', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ event: msg, timestamp: new Date(), examId }),
+          });
+        });
+
+        // 🔹 Audio detection (background voices / suspicious sounds)
+        startAudioDetection(stream, (msg) => {
+          updateCheatingLog(examId, msg);
+          fetch('/api/log-event', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ event: msg, timestamp: new Date(), examId }),
+          });
+        });
+
+        // 🔹 Video recording
+        recorderRef.current = startRecording(stream, (blob) => {
+          const formData = new FormData();
+          formData.append('videoChunk', blob);
+          fetch('/api/video/upload-chunk', { method: 'POST', body: formData });
+        });
+      } catch (err) {
+        console.error('Error accessing webcam/microphone:', err);
+        toast.error('Webcam or microphone access denied!');
+      }
+    }
+    init();
+
+    return () => {
+      if (recorderRef.current) recorderRef.current.stop();
+      if (videoRef.current?.srcObject) {
+        videoRef.current.srcObject.getTracks().forEach((track) => track.stop());
+      }
+    };
+  }, [examId, updateCheatingLog]);
+
+  // MCQ completion → go to coding
   const handleMcqCompletion = () => {
     setIsMcqCompleted(true);
-    // Reset cheating log for coding exam
     resetCheatingLog(examId);
     navigate(`/exam/${examId}/codedetails`);
   };
 
+  // Final submission
   const handleTestSubmission = async () => {
-    if (isSubmitting) return; // Prevent multiple submissions
+    if (isSubmitting) return;
 
     try {
       setIsSubmitting(true);
 
-      // Make sure we have the latest user info in the log
       const updatedLog = {
         ...cheatingLog,
         username: userInfo.name,
@@ -69,11 +140,11 @@ const TestPage = () => {
         multipleFaceCount: parseInt(cheatingLog.multipleFaceCount) || 0,
         cellPhoneCount: parseInt(cheatingLog.cellPhoneCount) || 0,
         prohibitedObjectCount: parseInt(cheatingLog.prohibitedObjectCount) || 0,
+        drowsinessCount: parseInt(cheatingLog.drowsinessCount) || 0,
+        audioAlertCount: parseInt(cheatingLog.audioAlertCount) || 0, // 👈 NEW
       };
 
       console.log('Submitting cheating log:', updatedLog);
-
-      // Save the cheating log
       const result = await saveCheatingLogMutation(updatedLog).unwrap();
       console.log('Cheating log saved:', result);
 
@@ -128,6 +199,7 @@ const TestPage = () => {
               </Box>
             </BlankCard>
           </Grid>
+
           <Grid item xs={12} md={5} lg={5}>
             <Grid container spacing={3}>
               <Grid item xs={12}>
@@ -151,18 +223,26 @@ const TestPage = () => {
                   </Box>
                 </BlankCard>
               </Grid>
+
+              {/* Webcam + detection */}
               <Grid item xs={12}>
                 <BlankCard>
                   <Box
                     width="300px"
-                    maxHeight="180px"
+                    maxHeight="220px"
                     boxShadow={3}
                     display="flex"
                     flexDirection="column"
-                    alignItems="start"
+                    alignItems="center"
                     justifyContent="center"
                   >
-                    <WebCam cheatingLog={cheatingLog} updateCheatingLog={updateCheatingLog} />
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      style={{ width: '100%', borderRadius: '8px' }}
+                    />
                   </Box>
                 </BlankCard>
               </Grid>
